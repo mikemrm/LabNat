@@ -157,20 +157,5 @@ start() {
 [ "$1" == "stop" ] && { shift; stop; exit; }
 [ "$1" == "restart" ] && { shift; stop; start; exit; }
 [ "$1" == "status" ] && { status; exit; }
-[ "$1" == "resetfirewall" ] && {
-	! [ -f "$ip_assoc" ] && die 'Not Running.' || args=$(cat "$argsfile")
-	echo "Clearing Routes...";
-	iptables -t nat -F PREROUTING
-	iptables -t nat -F POSTROUTING
-	for nat_alias in $args; do
-		nat_name="nat_$(echo "$nat_alias" | cut -d'=' -f 1)"
-		nat_ip="$(echo "$nat_alias" | cut -d'=' -f 2)"
-		ext="$(getInterfaceIp $nat_name)"
-		[ -z "$ext" ] && echo "$nat_name: No IP Address." || {
-			echo "Adding nat rules $nat_ip -> $ext"
-			addNatRule "$nat_name" "$nat_ip" "$ext"
-		}
-	done
-}
 
 exit 1
