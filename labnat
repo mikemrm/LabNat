@@ -1,0 +1,176 @@
+#!/bin/bash
+
+running_file="/tmp/.labnat_running"
+
+ip_list="/etc/labnat"
+ip_assoc="/tmp/.labnat_ip_assoc"
+
+wan_interface="enp0s3"
+lan_interface="enp0s8"
+temp_interface="_temp_nat_"
+
+msg(){
+	>&2 echo $@
+}
+
+die(){
+	msg "$@";
+	exit 1
+}
+
+
+[ "$#" -eq 0 ] && die 'No Arguments provided.';
+
+
+getAssocIpByInternalIp() {
+	int="$1"
+	grep "^$1=" "$ip_assoc" | sed 's/^.*\?=\(.*\?\)\#.*$/\1/' 2>/dev/null
+	return ${PIPESTATUS[0]}
+}
+getAssocIpByMac() {
+	int="$1"
+	grep "^.*=$1#" "$ip_assoc" | sed 's/^.*\?=\(.*\?\)\#.*$/\1/' 2>/dev/null
+	return ${PIPESTATUS[0]}
+}
+updateAssocByInternalIp() {
+	int_ip="$1"
+	mac="$2"
+	new_ip="$3"
+	[ -z "$int_ip" ] && { msg 'Invalid Internal IP'; return 1; };
+	[ -z "$mac" ] && { msg 'Invalid MAC'; return 1; };
+	[ -z "$new_ip" ] && { msg 'Invalid WAN IP'; return 1; };
+	grep "^$int_ip" "$ip_assoc" && sed -i 's/^.*\?='"$mac"'\#.*$/'"$int_ip=$mac#$new_ip"'/g' "$ip_assoc" || echo "$int_ip=$mac#$new_ip" >> "$ip_assoc"
+}
+assocSplit(){
+	echo $record | sed 's/^\(.*\?\)=\(.*\?\)\#\(.*\)/\1 \2 \3/g'
+}
+
+createInterface(){
+	src="$1"
+	mac="$2"
+	int="$3"
+	[ -n "$src" ] && ip link show "$src" &>/dev/null || { msg "Invalid Source."; return 1; }
+	[ -n "$temp_interface" ] && ip link show "$temp_interface" &>/dev/null && msg "Interface already exists." && return 2
+	assign_mac=""
+	[ -n "$mac" ] && assign_mac=" address $mac"
+	ip link add dev "$temp_interface" link "$src" $assign_mac up type macvlan &>/dev/null || { msg "Failed to create interface."; return 3; }
+	new_ip_mac="$(getInterfaceIp $temp_interface)";
+	ret=$?
+	new_ip="$(echo $new_ip_mac | cut -d' ' -f 1)"
+	new_mac="$(echo $new_ip_mac | cut -d' ' -f 2)"
+	ip link delete dev "$temp_interface" &>/dev/null
+	ip addr add "$new_ip"/32 dev "$wan_interface" || { msg "Failed to add IP to wan interface."; return 4; }
+	updateAssocByInternalIp "$int" "$new_mac" "$new_ip" &>/dev/null
+	echo "$new_ip"
+	return $ret
+}
+request_count=0
+getInterfaceIp(){
+	(( request_count += 1 ))
+	res="$(dhclient -v -sf /etc/dhcp/dhclient-clear-routes.sh "$@" 2>&1)";
+	ret=$?
+	[ $ret -eq 0 ] && {
+		if_ip="$(echo "$res" | grep "bound to" | awk '{ print $3 }')"
+		if_mac="$(echo "$res" | grep -m1 "Listening on LPF" | awk -F'/' '{ print $NF }')"
+		[ -n "$if_ip" ] && [ -n "$if_mac" ] && {
+			echo "$if_ip $if_mac";
+			request_count=0
+			return 0;
+		}
+		request_count=0
+		return 1
+	}
+	echo "$res" | grep "is already running" &>/dev/null && {
+		msg 'DHClient is already running, killing first...';
+		pid="$(echo "$res" | grep "is already running" | sed 's/^.*dhclient(\([0-9]\+\)).*$/\1/g')"
+		[ -z "$pid" ] && die 'Failed to determine PID, try killing it manually.' || {
+			kill $pid && msg 'Killed!' && {
+				[ $request_count -gt 2 ] && { msg 'FAILED: Max tries reached.'; request_count=0 return 1; } || { getInterfaceIp $@; request_count=0; return $?; };
+			} && { request_count=0; return $?; };
+		}
+	}
+	msg 'Failed to determine interface IP.'
+	request_count=0
+	return 1
+}
+addNatRule(){
+	int="$1"
+	ext="$2"
+	[ -z "$int" ] && { msg 'Invalid Internal IP'; return 1; }
+	[ -z "$ext" ] && { msg 'Invalid External IP'; return 1; }
+	iptables -t nat -A PREROUTING -d "$ext" -i "$wan_interface" -j DNAT --to-destination "$int"
+	iptables -t nat -A POSTROUTING -s "$int" -o "$wan_interface" -j SNAT --to "$ext"
+}
+removeNatRule(){
+	int="$1"
+	ext="$2"
+	[ -z "$int" ] && { msg 'Invalid Internal IP'; return 1; }
+	[ -z "$ext" ] && { msg 'Invalid External IP'; return 1; }
+	iptables -t nat -D PREROUTING -d "$ext" -i "$wan_interface" -j DNAT --to-destination "$int"
+	iptables -t nat -D POSTROUTING -s "$int" -o "$wan_interface" -j SNAT --to "$ext"
+}
+
+status() {
+	[ -f "$ip_assoc" ] || { msg 'Not Running.'; return 1; };
+	cat "$ip_assoc"
+}
+
+stop(){
+	[ -f "$running_file" ] || { msg 'Not Running.'; return 1; };
+	[ -f "$ip_assoc" ] || die 'DB Not found.'
+	msg 'Clearing Forwards...'
+	iptables -D FORWARD -i "$lan_interface" -o "$wan_interface" -j ACCEPT
+	iptables -D FORWARD -i "$wan_interface" -o "$lan_interface" -j ACCEPT
+	msg 'Removing IPs...'
+	assoc="$(cat "$ip_assoc")"
+	for record in $assoc; do
+		read int_ip wan_mac wan_ip <<<$(assocSplit $record)
+		[ -n "$wan_ip" ] && ip addr del "$wan_ip"/32 dev "$wan_interface"
+		removeNatRule "$int_ip" "$wan_ip"
+	done
+	rm -f "$running_file"
+	return 0
+}
+start() {
+	[ -f "$running_file" ] && die 'Already Running.'
+	touch "$running_file"
+	ips="$@"
+	[ "$#" -eq 0 ] && { [ -f "$ip_list" ]  && ips="$(cat "$ip_list")" || { msg "No arguments provided"; return 1; }; };
+	
+
+
+	iptables -A FORWARD -i "$lan_interface" -o "$wan_interface" -j ACCEPT
+	iptables -A FORWARD -i "$wan_interface" -o "$lan_interface" -j ACCEPT
+
+	for nat_ip in $ips; do
+		msg "Creating NAT for $nat_ip ..."
+		wan_mac="$(getAssocIpByInternalIp "$nat_ip")"
+		wan_ip="$(createInterface "$wan_interface" "$wan_mac" "$nat_ip")"
+		[ $? -eq 0 ] && {
+			msg "IP Association $nat_ip > $wan_ip";
+			addNatRule "$nat_ip" "$wan_ip"
+			msg "Done"
+		}
+	done
+}
+[ "$1" == "start" ] && { shift; start $@; exit; }
+[ "$1" == "stop" ] && { shift; stop; exit; }
+[ "$1" == "restart" ] && { shift; stop; start; exit; }
+[ "$1" == "status" ] && { status; exit; }
+[ "$1" == "resetfirewall" ] && {
+	! [ -f "$ip_assoc" ] && die 'Not Running.' || args=$(cat "$argsfile")
+	echo "Clearing Routes...";
+	iptables -t nat -F PREROUTING
+	iptables -t nat -F POSTROUTING
+	for nat_alias in $args; do
+		nat_name="nat_$(echo "$nat_alias" | cut -d'=' -f 1)"
+		nat_ip="$(echo "$nat_alias" | cut -d'=' -f 2)"
+		ext="$(getInterfaceIp $nat_name)"
+		[ -z "$ext" ] && echo "$nat_name: No IP Address." || {
+			echo "Adding nat rules $nat_ip -> $ext"
+			addNatRule "$nat_name" "$nat_ip" "$ext"
+		}
+	done
+}
+
+exit 1
