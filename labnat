@@ -2,7 +2,7 @@
 
 running_file="/tmp/.labnat_running"
 
-ip_list="/etc/labnat"
+ip_list="/opt/labnat/lab_ips"
 ip_assoc="/tmp/.labnat_ip_assoc"
 
 wan_interface="enp0s3"
